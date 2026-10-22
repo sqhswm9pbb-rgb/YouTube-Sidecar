@@ -297,13 +297,16 @@ func (p *MediaProvider) streamDownloaded(w http.ResponseWriter, r *http.Request,
 }
 
 func (p *MediaProvider) transcode(w http.ResponseWriter, r *http.Request, input io.Reader, videoMode bool, waitInput func() error) error {
-	args := []string{"-hide_banner", "-loglevel", "error", "-nostdin", "-i", "pipe:0"}
+	// yt-dlp and temporary downloads can provide data faster than real time.
+	// Pace FFmpeg's reads so speakers receive a live stream instead of a burst
+	// that drains before their playback buffer catches up.
+	args := []string{"-hide_banner", "-loglevel", "error", "-nostdin", "-re", "-i", "pipe:0"}
 	contentType := "audio/mpeg"
 	if videoMode {
 		args = append(args, "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-c:a", "aac", "-b:a", "192k", "-f", "mp4", "-movflags", "frag_keyframe+empty_moov")
 		contentType = "video/mp4"
 	} else {
-		args = append(args, "-vn", "-ac", "2", "-ar", "44100", "-c:a", "libmp3lame", "-b:a", "192k", "-f", "mp3")
+		args = append(args, "-vn", "-ac", "2", "-ar", "44100", "-c:a", "libmp3lame", "-b:a", "256k", "-f", "mp3")
 	}
 	args = append(args, "pipe:1")
 	ffmpeg := exec.CommandContext(r.Context(), p.ffmpeg, args...)
@@ -343,16 +346,19 @@ func (p *MediaProvider) transcode(w http.ResponseWriter, r *http.Request, input 
 		}
 	}
 	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Connection", "close")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(http.StatusOK)
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
+	flusher, _ := w.(http.Flusher)
 	_, writeErr := w.Write(firstByte[:firstCount])
 	copyErr := writeErr
+	if copyErr == nil && flusher != nil {
+		flusher.Flush()
+	}
 	if copyErr == nil {
-		_, copyErr = io.Copy(w, stdout)
+		copyErr = copyAndFlush(w, stdout, flusher)
 	}
 	if copyErr != nil {
 		_ = stdout.Close()
@@ -377,4 +383,29 @@ func (p *MediaProvider) transcode(w http.ResponseWriter, r *http.Request, input 
 		return fmt.Errorf("ffmpeg stream failed: %w", ffmpegErr)
 	}
 	return nil
+}
+
+func copyAndFlush(dst io.Writer, src io.Reader, flusher http.Flusher) error {
+	buf := make([]byte, 64*1024)
+	for {
+		n, readErr := src.Read(buf)
+		if n > 0 {
+			written, writeErr := dst.Write(buf[:n])
+			if writeErr != nil {
+				return writeErr
+			}
+			if written != n {
+				return io.ErrShortWrite
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if readErr != nil {
+			if readErr == io.EOF {
+				return nil
+			}
+			return readErr
+		}
+	}
 }
